@@ -1,0 +1,12 @@
+CREATE TABLE IF NOT EXISTS exclusions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  id_adherent INT NOT NULL,
+  id_produit INT NULL,
+  motif TEXT NOT NULL,
+  duree VARCHAR(100) NOT NULL DEFAULT 'Temporaire (3 mois)',
+  statut VARCHAR(50) NOT NULL DEFAULT 'active',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT fk_exclusions_adherent FOREIGN KEY (id_adherent) REFERENCES adherents(id) ON DELETE CASCADE,
+  CONSTRAINT fk_exclusions_produit FOREIGN KEY (id_produit) REFERENCES produits(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
