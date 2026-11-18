@@ -4,6 +4,5 @@
 node_modules/
 dist/
 .postman/
-postman/
 sql/create_auth_tables.sql
 sql/reset_test_data.sql
