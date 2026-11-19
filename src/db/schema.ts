@@ -74,6 +74,12 @@ export const bons = mysqlTable('bons', {
   montantTotal: decimal('montant_total', { precision: 12, scale: 2 }).notNull().default('0'),
   montantBase: decimal('montant_base', { precision: 12, scale: 2 }),
   tauxCouverture: decimal('taux_couverture', { precision: 5, scale: 2 }),
+  basvValidatedBy: int('basv_validated_by'),
+  basvValidatorName: varchar('basv_validator_name', { length: 255 }),
+  basvValidatedAt: timestamp('basv_validated_at'),
+  dgValidatedBy: int('dg_validated_by'),
+  dgValidatorName: varchar('dg_validator_name', { length: 255 }),
+  dgValidatedAt: timestamp('dg_validated_at'),
   dateBon: date('date_bon').notNull(),
   statut: varchar('statut', { length: 50 }).notNull().default('en_attente'),
   createdAt: timestamp('created_at').defaultNow(),
@@ -147,4 +153,21 @@ export const remboursements = mysqlTable('remboursements', {
   documentMime: varchar('document_mime', { length: 100 }),
   createdAt: timestamp('created_at').defaultNow(),
   updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+export const recusBons = mysqlTable('recus_bons', {
+  id: serial('id').primaryKey(),
+  idBon: int('id_bon').notNull().unique(),
+  contenu: mediumtext('contenu').notNull(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+export const recusConfirmationPaiement = mysqlTable('recus_confirmation_paiement', {
+  id: serial('id').primaryKey(),
+  idRemboursement: int('id_remboursement').notNull().unique(),
+  contenu: mediumtext('contenu').notNull(),
+  envoyePar: int('envoye_par'),
+  nomEnvoyeur: varchar('nom_envoyeur', { length: 255 }),
+  envoyeLe: timestamp('envoye_le'),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
 });

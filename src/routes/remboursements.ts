@@ -27,10 +27,11 @@ router.get('/', async (req, res) => {
       CONCAT(COALESCE(ad.nom, ''), ' ', COALESCE(ad.prenoms, '')) AS adherent_nom,
       COALESCE(r.montant, b.montant) AS montant,
       COALESCE(r.date_remboursement, CURRENT_DATE()) AS date_remboursement,
-      COALESCE(r.statut, 'en_attente_justificatif') AS statut,
-      r.document_nom,
-      r.document_mime,
-      (r.document_basv IS NOT NULL) AS has_document
+      COALESCE(r.statut, CASE WHEN b.statut = 'paye' THEN 'paye' ELSE 'a_rembourser' END) AS statut,
+      (rcp.id IS NOT NULL) AS has_payment_receipt,
+      (rcp.envoye_le IS NOT NULL) AS payment_receipt_sent,
+      rcp.nom_envoyeur AS payment_receipt_sender,
+      rcp.envoye_le AS payment_receipt_sent_at
     FROM bons b
     LEFT JOIN remboursements r ON r.id = (
       SELECT r2.id
@@ -41,97 +42,58 @@ router.get('/', async (req, res) => {
     )
     LEFT JOIN agents a ON a.id = b.id_agent
     LEFT JOIN adherents ad ON ad.id = b.id_adherent
+    LEFT JOIN recus_confirmation_paiement rcp ON rcp.id_remboursement = r.id
     ${scopeClause}
     ORDER BY b.id DESC
   `, scopeParams);
   return res.json(rows);
 });
 
-router.post('/bons/:bonId/document', async (req, res) => {
+router.post('/:id/transmit-payment-receipt', async (req, res) => {
   const user = (req as any).user;
-  if (!['admin', 'basv'].includes(user?.role)) {
-    return res.status(403).json({ message: 'Seul le BASV peut transmettre le justificatif de remboursement.' });
+  if (user?.role !== 'basv') {
+    return res.status(403).json({ message: 'Seul le BASV peut transmettre le reçu de confirmation généré.' });
   }
 
-  const bonId = Number(req.params.bonId);
-  const { fileName, mimeType, data } = req.body || {};
-  const allowedTypes = new Set(['application/pdf', 'image/jpeg', 'image/png']);
-  if (!Number.isInteger(bonId) || bonId <= 0 || typeof fileName !== 'string' || typeof data !== 'string' || !allowedTypes.has(mimeType)) {
-    return res.status(400).json({ message: 'Fournissez un bon valide et un justificatif PDF, JPEG ou PNG.' });
-  }
-  const extension = fileName.toLowerCase().split('.').pop();
-  const validExtensions: Record<string, string[]> = {
-    'application/pdf': ['pdf'],
-    'image/jpeg': ['jpg', 'jpeg'],
-    'image/png': ['png'],
-  };
-  if (!validExtensions[mimeType].includes(extension || '')) {
-    return res.status(400).json({ message: 'L’extension du fichier ne correspond pas à son format.' });
+  const reimbursementId = Number(req.params.id);
+  if (!Number.isInteger(reimbursementId) || reimbursementId <= 0) {
+    return res.status(400).json({ message: 'Identifiant de remboursement invalide.' });
   }
 
-  const base64 = data.replace(/^data:[^,]+;base64,/, '');
-  if (!base64 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) {
-    return res.status(400).json({ message: 'Le fichier transmis est invalide.' });
-  }
-  const document = Buffer.from(base64, 'base64');
-  if (document.length === 0 || document.length > 8 * 1024 * 1024 || document.toString('base64') !== base64) {
-    return res.status(400).json({ message: 'Le justificatif doit peser au maximum 8 Mo.' });
-  }
-
-  const isValidFile = mimeType === 'application/pdf'
-    ? document.subarray(0, 5).toString('ascii') === '%PDF-'
-    : mimeType === 'image/png'
-      ? document.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
-      : document.subarray(0, 3).equals(Buffer.from([255, 216, 255]));
-  if (!isValidFile) {
-    return res.status(400).json({ message: 'Le contenu du fichier ne correspond pas à son format.' });
+  const senderId = Number(user.id);
+  if (!Number.isInteger(senderId) || senderId <= 0) {
+    return res.status(401).json({ message: 'Identité du BASV introuvable.' });
   }
 
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    const [bonRows] = await connection.execute(
-      "SELECT id, id_agent, id_adherent, montant, statut FROM bons WHERE id = ? FOR UPDATE",
-      [bonId]
-    );
-    const bon = Array.isArray(bonRows) ? bonRows[0] as {
-      id: number;
-      id_agent: number;
-      id_adherent: number;
-      montant: number | string;
-      statut: string;
-    } | undefined : undefined;
+    const [rows] = await connection.execute(`
+      SELECT r.id, r.statut, rcp.id AS receipt_id
+      FROM remboursements r
+      LEFT JOIN recus_confirmation_paiement rcp ON rcp.id_remboursement = r.id
+      WHERE r.id = ?
+      FOR UPDATE
+    `, [reimbursementId]) as [Array<{ id: number; statut: string; receipt_id: number | null }>, unknown];
+    const reimbursement = rows[0];
 
-    if (!bon || !['bon_disponible', 'valide'].includes(bon.statut)) {
+    if (!reimbursement || reimbursement.statut !== 'paye') {
       await connection.rollback();
-      return res.status(409).json({ message: 'Le bon doit être disponible et non encore remboursé avant le dépôt du justificatif.' });
+      return res.status(409).json({ message: 'L’agent doit d’abord confirmer le remboursement à la caisse.' });
+    }
+    if (!reimbursement.receipt_id) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'Le reçu de paiement n’a pas été généré.' });
     }
 
-    const [remboursementRows] = await connection.execute(
-      'SELECT id FROM remboursements WHERE id_bon = ? ORDER BY id DESC LIMIT 1 FOR UPDATE',
-      [bonId]
-    );
-    const remboursementId = Array.isArray(remboursementRows)
-      ? (remboursementRows[0] as { id?: number } | undefined)?.id
-      : undefined;
-
-    if (remboursementId) {
-      await connection.execute(`
-        UPDATE remboursements
-        SET document_basv = ?, document_nom = ?, document_mime = ?, statut = 'pret_a_rembourser',
-            montant = ?, date_remboursement = CURRENT_DATE()
-        WHERE id = ?
-      `, [document.toString('base64'), fileName.slice(0, 255), mimeType, Number(bon.montant), remboursementId]);
-    } else {
-      await connection.execute(`
-        INSERT INTO remboursements
-          (id_bon, id_agent, id_adherent, montant, date_remboursement, statut, document_basv, document_nom, document_mime)
-        VALUES (?, ?, ?, ?, CURRENT_DATE(), 'pret_a_rembourser', ?, ?, ?)
-      `, [bon.id, bon.id_agent, bon.id_adherent, Number(bon.montant), document.toString('base64'), fileName.slice(0, 255), mimeType]);
-    }
-
+    const senderName = String(user.name || user.email || 'BASV').slice(0, 255);
+    await connection.execute(`
+      UPDATE recus_confirmation_paiement
+      SET envoye_par = ?, nom_envoyeur = ?, envoye_le = CURRENT_TIMESTAMP
+      WHERE id_remboursement = ?
+    `, [senderId, senderName, reimbursementId]);
     await connection.commit();
-    return res.json({ message: 'Justificatif transmis à l’agent pour le remboursement.' });
+    return res.json({ message: 'Le reçu de confirmation généré a été transmis à l’agent.' });
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -140,36 +102,41 @@ router.post('/bons/:bonId/document', async (req, res) => {
   }
 });
 
-router.get('/bons/:bonId/document', async (req, res) => {
+router.get('/:id/payment-receipt', async (req, res) => {
   const user = (req as any).user;
-  const bonId = Number(req.params.bonId);
-  const isAgent = user?.role === 'agent';
-  const [rows] = await pool.execute(`
-    SELECT r.document_basv, r.document_nom, r.document_mime
-    FROM remboursements r
-    INNER JOIN bons b ON b.id = r.id_bon
-    WHERE b.id = ? AND b.statut IN ('valide', 'bon_disponible', 'paye')
-      AND r.document_basv IS NOT NULL
-      ${isAgent ? 'AND b.id_agent = ?' : ''}
-    ORDER BY r.id DESC
-    LIMIT 1
-  `, isAgent ? [bonId, Number(user.idAgent || -1)] : [bonId]) as [Array<{
-    document_basv: string;
-    document_nom: string;
-    document_mime: string;
-  }>, unknown];
-
-  const document = rows[0];
-  if (!document) {
-    return res.status(404).json({ message: 'Justificatif non trouvé.' });
+  if (user?.role !== 'agent') {
+    return res.status(403).json({ message: 'Seul l’agent concerné peut télécharger ce reçu.' });
   }
 
-  const safeName = String(document.document_nom || 'justificatif').replace(/[\r\n"\\/]/g, '_');
-  res.setHeader('Content-Type', document.document_mime);
-  res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  return res.send(Buffer.from(document.document_basv, 'base64'));
+  const reimbursementId = Number(req.params.id);
+  const [rows] = await pool.execute(`
+    SELECT rcp.contenu, rcp.nom_envoyeur, rcp.envoye_le
+    FROM recus_confirmation_paiement rcp
+    INNER JOIN remboursements r ON r.id = rcp.id_remboursement
+    WHERE r.id = ? AND r.id_agent = ? AND r.statut = 'paye' AND rcp.envoye_le IS NOT NULL
+    LIMIT 1
+  `, [reimbursementId, Number(user.idAgent || -1)]) as [Array<{
+    contenu: string;
+    nom_envoyeur: string;
+    envoye_le: string;
+  }>, unknown];
+
+  if (!rows.length) {
+    return res.status(404).json({ message: 'Le reçu de confirmation n’a pas encore été transmis par le BASV.' });
+  }
+
+  try {
+    return res.json({
+      ...JSON.parse(rows[0].contenu),
+      transmission: {
+        basv: rows[0].nom_envoyeur,
+        transmiseLe: rows[0].envoye_le,
+      },
+    });
+  } catch (error) {
+    console.error('Reçu de confirmation de paiement enregistré invalide:', error);
+    return res.status(500).json({ message: 'Impossible de lire le reçu de confirmation.' });
+  }
 });
 
 router.get('/:id', async (req, res) => {
@@ -198,47 +165,104 @@ router.post('/:id/confirm', async (req, res) => {
     return res.status(403).json({ message: 'Seul l’agent concerné peut confirmer le remboursement.' });
   }
 
+  const confirmationId = Number(user.id);
+  if (!Number.isInteger(confirmationId) || confirmationId <= 0) {
+    return res.status(401).json({ message: 'Identité de l’agent introuvable.' });
+  }
+
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
     const [rows] = await connection.execute(`
-      SELECT r.id, r.id_bon, r.statut, (r.document_basv IS NOT NULL) AS has_document, b.id_agent
+      SELECT r.id, r.id_bon, r.id_agent, r.id_adherent, r.montant, r.statut,
+             b.numero_bon, b.date_bon,
+             a.matricule AS agent_matricule,
+             CONCAT(COALESCE(a.nom, ''), ' ', COALESCE(a.prenoms, '')) AS agent_nom,
+             ad.num_adherent AS adherent_numero,
+             CONCAT(COALESCE(ad.nom, ''), ' ', COALESCE(ad.prenoms, '')) AS adherent_nom
       FROM remboursements r
       INNER JOIN bons b ON b.id = r.id_bon
+      INNER JOIN agents a ON a.id = r.id_agent
+      LEFT JOIN adherents ad ON ad.id = r.id_adherent
       WHERE r.id = ?
       FOR UPDATE
-    `, [Number(req.params.id)]);
+    `, [Number(req.params.id)]) as [Array<{
+      id: number;
+      id_bon: number;
+      id_agent: number;
+      id_adherent: number;
+      montant: number | string;
+      statut: string;
+      numero_bon: string;
+      date_bon: string;
+      agent_matricule: string | null;
+      agent_nom: string;
+      adherent_numero: string | null;
+      adherent_nom: string | null;
+    }>, unknown];
     const reimbursement = Array.isArray(rows) ? rows[0] as {
       id: number;
       id_bon: number;
-      statut: string;
-      has_document: boolean | number;
       id_agent: number;
+      id_adherent: number;
+      montant: number | string;
+      statut: string;
+      numero_bon: string;
+      date_bon: string;
+      agent_matricule: string | null;
+      agent_nom: string;
+      adherent_numero: string | null;
+      adherent_nom: string | null;
     } | undefined : undefined;
 
     if (!reimbursement || Number(reimbursement.id_agent) !== Number(user.idAgent || -1)) {
       await connection.rollback();
       return res.status(404).json({ message: 'Remboursement non trouvé.' });
     }
-    if (!reimbursement.has_document) {
+    if (!['a_rembourser', 'pret_a_rembourser', 'preuve_paiement_transmise'].includes(reimbursement.statut)) {
       await connection.rollback();
-      return res.status(409).json({ message: 'Le BASV doit d’abord transmettre le justificatif de remboursement.' });
-    }
-    if (reimbursement.statut !== 'pret_a_rembourser') {
-      await connection.rollback();
-      return res.status(409).json({ message: 'Ce remboursement n’est pas en attente de confirmation.' });
+      return res.status(409).json({ message: 'Ce remboursement n’est pas en attente de confirmation par l’agent.' });
     }
 
     await connection.execute(
-      "UPDATE remboursements SET statut = 'paye', date_remboursement = CURRENT_DATE() WHERE id = ? AND statut = 'pret_a_rembourser'",
+      "UPDATE remboursements SET statut = 'paye', date_remboursement = CURRENT_DATE() WHERE id = ? AND statut IN ('a_rembourser', 'pret_a_rembourser', 'preuve_paiement_transmise')",
       [reimbursement.id]
     );
     await connection.execute(
       "UPDATE bons SET statut = 'paye' WHERE id = ? AND statut IN ('bon_disponible', 'valide')",
       [reimbursement.id_bon]
     );
+
+    const confirmedAt = new Date().toISOString();
+    const receipt = {
+      numero: `REC-PAIEMENT-${reimbursement.numero_bon}`,
+      genereLe: confirmedAt,
+      bon: {
+        numero: reimbursement.numero_bon,
+        date: reimbursement.date_bon,
+      },
+      paiement: {
+        montant: reimbursement.montant,
+        confirmeLe: confirmedAt,
+        confirmePar: {
+          matricule: reimbursement.agent_matricule,
+          nom: reimbursement.agent_nom,
+          email: user.email,
+        },
+      },
+      adherent: {
+        numero: reimbursement.adherent_numero,
+        nom: reimbursement.adherent_nom,
+      },
+      statut: 'paye',
+    };
+    await connection.execute(
+      'INSERT INTO recus_confirmation_paiement (id_remboursement, contenu) VALUES (?, ?)',
+      [reimbursement.id, JSON.stringify(receipt)]
+    );
+
     await connection.commit();
-    return res.json({ message: 'Remboursement confirmé.' });
+    return res.json({ message: 'Remboursement confirmé et reçu de paiement généré.', receipt });
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -258,8 +282,8 @@ router.options('/', (_req, res) => {
 
 router.post('/', async (req, res) => {
   const { idBon, idAgent, idAdherent, montant, dateRemboursement, statut } = req.body;
-  if (statut === 'paye' && (req as any).user?.role !== 'admin') {
-    return res.status(403).json({ message: 'Seule la confirmation de l’agent concerné peut enregistrer le remboursement effectué.' });
+  if (statut === 'paye') {
+    return res.status(409).json({ message: 'Le remboursement est marqué payé uniquement après confirmation par l’agent.' });
   }
 
   if (!idBon || !idAgent || !idAdherent || montant === undefined || montant === null || !dateRemboursement) {
@@ -289,8 +313,8 @@ router.put('/:id', async (req, res) => {
   if (payload.statut !== undefined && (req as any).user?.role !== 'admin') {
     return res.status(403).json({ message: 'Le statut doit être changé uniquement par l’étape de remboursement prévue.' });
   }
-  if (payload.statut === 'paye' && (req as any).user?.role !== 'admin') {
-    return res.status(403).json({ message: 'Seule la confirmation de l’agent concerné peut enregistrer le remboursement effectué.' });
+  if (payload.statut === 'paye') {
+    return res.status(409).json({ message: 'Le remboursement est marqué payé uniquement après confirmation par l’agent.' });
   }
   const fields: string[] = [];
   const values: any[] = [];
@@ -341,8 +365,8 @@ router.patch('/:id', async (req, res) => {
   if (payload.statut !== undefined && (req as any).user?.role !== 'admin') {
     return res.status(403).json({ message: 'Le statut doit être changé uniquement par l’étape de remboursement prévue.' });
   }
-  if (payload.statut === 'paye' && (req as any).user?.role !== 'admin') {
-    return res.status(403).json({ message: 'Seule la confirmation de l’agent concerné peut enregistrer le remboursement effectué.' });
+  if (payload.statut === 'paye') {
+    return res.status(409).json({ message: 'Le remboursement est marqué payé uniquement après confirmation par l’agent.' });
   }
 
   const fields: string[] = [];

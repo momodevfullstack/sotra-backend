@@ -252,6 +252,47 @@ async function ensureReimbursementDocumentSchema() {
   await ensureColumn('remboursements', 'document_mime', 'VARCHAR(100) NULL');
 }
 
+async function ensureBonReceiptSchema() {
+  await ensureColumn('bons', 'basv_validated_by', 'INT NULL');
+  await ensureColumn('bons', 'basv_validator_name', 'VARCHAR(255) NULL');
+  await ensureColumn('bons', 'basv_validated_at', 'TIMESTAMP NULL');
+  await ensureColumn('bons', 'dg_validated_by', 'INT NULL');
+  await ensureColumn('bons', 'dg_validator_name', 'VARCHAR(255) NULL');
+  await ensureColumn('bons', 'dg_validated_at', 'TIMESTAMP NULL');
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS recus_bons (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      id_bon INT NOT NULL UNIQUE,
+      contenu MEDIUMTEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT fk_recus_bons_bon FOREIGN KEY (id_bon) REFERENCES bons(id) ON DELETE CASCADE
+    )
+  `);
+}
+
+async function ensurePaymentReceiptSchema() {
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS recus_confirmation_paiement (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      id_remboursement INT NOT NULL UNIQUE,
+      contenu MEDIUMTEXT NOT NULL,
+      envoye_par INT NULL,
+      nom_envoyeur VARCHAR(255) NULL,
+      envoye_le TIMESTAMP NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT fk_recus_confirmation_remboursement
+        FOREIGN KEY (id_remboursement) REFERENCES remboursements(id) ON DELETE CASCADE
+    )
+  `);
+  await pool.execute(`
+    INSERT INTO remboursements (id_bon, id_agent, id_adherent, montant, date_remboursement, statut)
+    SELECT b.id, b.id_agent, b.id_adherent, b.montant, CURRENT_DATE(), 'a_rembourser'
+    FROM bons b
+    WHERE b.statut IN ('bon_disponible', 'valide')
+      AND NOT EXISTS (SELECT 1 FROM remboursements r WHERE r.id_bon = b.id)
+  `);
+}
+
 async function ensureDatabaseSchema() {
   await ensureBordereauxTable();
   await ensureColumn('bons', 'id_bordereau', 'INT NULL AFTER numero_bon');
@@ -300,6 +341,8 @@ async function ensureDatabaseSchema() {
   ]);
   await ensureCollegeWorkflowSchema();
   await ensureReimbursementDocumentSchema();
+  await ensureBonReceiptSchema();
+  await ensurePaymentReceiptSchema();
 }
 
 ensureDatabaseSchema()

@@ -232,6 +232,11 @@ router.post('/:id/office-approve', async (req, res) => {
   }
 
   const bordereauId = Number(req.params.id);
+  const validatorId = Number(user.id);
+  if (!Number.isInteger(validatorId) || validatorId <= 0) {
+    return res.status(401).json({ message: 'Identité du BASV introuvable.' });
+  }
+  const validatorName = String(user.name || user.email || 'BASV').slice(0, 255);
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
@@ -283,9 +288,10 @@ router.post('/:id/office-approve', async (req, res) => {
 
     await connection.execute(`
       UPDATE bons
-      SET numero_bon = ?, montant_base = ?, taux_couverture = ?, montant = ?, statut = 'dg_a_valider'
+      SET numero_bon = ?, montant_base = ?, taux_couverture = ?, montant = ?, statut = 'dg_a_valider',
+          basv_validated_by = ?, basv_validator_name = ?, basv_validated_at = CURRENT_TIMESTAMP
       WHERE id = ? AND statut = 'medecin_termine'
-    `, [numeroBon, total, coverageRate, bonAmount, entry.bon_id]);
+    `, [numeroBon, total, coverageRate, bonAmount, validatorId, validatorName, entry.bon_id]);
     await connection.execute(
       "UPDATE bordereaux SET statut = 'valide', montant_total = ? WHERE id = ? AND statut = 'medecin_termine'",
       [total, bordereauId]
